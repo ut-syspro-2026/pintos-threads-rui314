@@ -26,7 +26,13 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
+/** Threads blocked in timer_sleep(), ordered by wakeup_tick. */
+static struct list sleep_list;
+
 static intr_handler_func timer_interrupt;
+static bool wakeup_less(const struct list_elem *, const struct list_elem *,
+                        void *aux);
+static void wake_sleeping_threads(void);
 static bool too_many_loops(unsigned loops);
 static void busy_wait(int64_t loops);
 static void real_time_sleep(int64_t num, int32_t denom);
@@ -35,6 +41,7 @@ static void real_time_delay(int64_t num, int32_t denom);
 /** Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
 void timer_init(void) {
+  list_init(&sleep_list);
   pit_configure_channel(0, 2, TIMER_FREQ);
   intr_register_ext(0x20, timer_interrupt, "8254 Timer");
 }
@@ -76,11 +83,19 @@ int64_t timer_elapsed(int64_t then) { return timer_ticks() - then; }
 
 /** Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
-void timer_sleep(int64_t ticks) {
-  int64_t start = timer_ticks();
+void timer_sleep(int64_t sleep_ticks) {
+  enum intr_level old_level;
+  struct thread *cur;
 
   ASSERT(intr_get_level() == INTR_ON);
-  while (timer_elapsed(start) < ticks) thread_yield();
+  if (sleep_ticks <= 0) return;
+
+  old_level = intr_disable();
+  cur = thread_current();
+  cur->wakeup_tick = ticks + sleep_ticks;
+  list_insert_ordered(&sleep_list, &cur->elem, wakeup_less, NULL);
+  thread_block();
+  intr_set_level(old_level);
 }
 
 /** Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -130,7 +145,33 @@ void timer_print_stats(void) {
 /** Timer interrupt handler. */
 static void timer_interrupt(struct intr_frame *args UNUSED) {
   ticks++;
+  wake_sleeping_threads();
   thread_tick();
+}
+
+/** Returns true if thread A should wake before thread B. */
+static bool wakeup_less(const struct list_elem *a, const struct list_elem *b,
+                        void *aux UNUSED) {
+  const struct thread *thread_a = list_entry(a, struct thread, elem);
+  const struct thread *thread_b = list_entry(b, struct thread, elem);
+
+  if (thread_a->wakeup_tick == thread_b->wakeup_tick)
+    return thread_a->priority > thread_b->priority;
+  return thread_a->wakeup_tick < thread_b->wakeup_tick;
+}
+
+/** Wakes all threads whose sleep interval has expired. */
+static void wake_sleeping_threads(void) {
+  ASSERT(intr_get_level() == INTR_OFF);
+
+  while (!list_empty(&sleep_list)) {
+    struct thread *t =
+        list_entry(list_front(&sleep_list), struct thread, elem);
+    if (t->wakeup_tick > ticks) break;
+
+    list_pop_front(&sleep_list);
+    thread_unblock(t);
+  }
 }
 
 /** Returns true if LOOPS iterations waits for more than one timer

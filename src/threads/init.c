@@ -292,7 +292,7 @@ static void run_actions(char **argv) {
   };
 
   /* Table of supported actions. */
-  static const struct action actions[] = {
+  static struct action actions[] = {
       {"run", 2, run_task},
 #ifdef FILESYS
       {"ls", 1, fsutil_ls},
